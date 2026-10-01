@@ -1,0 +1,51 @@
+﻿# LlamaGen-L + MASC + UPipe — Kaggle Free Tier (2× T4 16 GB each)
+# ---------------------------------------------------------------
+# Designed for proof-of-concept fine-tuning from a pretrained
+# LlamaGen-L checkpoint (c2i_L_256.pt, ~1.4 GB) on pre-extracted
+# ImageNet-1K token codes (vq_ds16_c2i.pt pipeline, ~8-12 GB).
+#
+# Memory budget per T4:
+#   - LlamaGen-L (343M params) fp16  ~  700 MB weights
+#   - MASC k=4096 vocab              ~  saved ~100 MB vs k=8192
+#   - UPipe chunk_heads=4            ~  ~4x peak VRAM reduction in attn
+#   - grad_checkpointing             ~  ~30% further VRAM saving
+#   - batch_size=8 + grad_accum=16   ~  effective batch = 128
+
+backbone:
+  name: llamagen_l
+  params: 343M
+  image_size: 256
+  tokenizer: llamagen_vq16384
+  pretrained: /kaggle/input/llamagen-weights/c2i_L_256.pt  # Kaggle dataset path
+
+masc:
+  k: 4096              # Smaller than paper's 8192 → saves ~70MB embedding VRAM
+  decode: random_sampling
+
+upipe:
+  enabled: true
+  chunk_heads: 4       # LlamaGen-L has 16 heads → U=4 stages → ~4x VRAM saving
+  use_flash: true      # Flash-Attention 2 within each chunk (T4 supports it)
+
+optimizer:
+  name: adamw
+  peak_lr: 5.0e-5      # Lower LR for fine-tuning (paper uses 1e-4 for scratch)
+  final_lr: 5.0e-6
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  weight_decay: 0.05
+
+train:
+  epochs: null          # Use total_steps instead
+  total_steps: 15000    # Proof-of-concept: ~2.5h on T4 with batch 8
+  global_batch_size: 128
+  local_batch_size: 8   # Per-GPU; multiply by num_gpus × grad_accum_steps
+  grad_accum_steps: 16  # effective batch = 8 × 16 = 128
+  grad_clip: 1.0
+  amp: true             # bf16 preferred; T4 uses fp16
+  amp_dtype: float16
+  ckpt_every: 2000      # Save every 2000 steps (~20 min)
+  grad_checkpointing: true
+
+num_workers: 2          # Kaggle has limited CPU cores
+log_every: 20           # More frequent for monitoring

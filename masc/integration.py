@@ -28,7 +28,7 @@ This file requires PyTorch; the numpy MASC core (clustering / mapping / relabel
 
 from __future__ import annotations
 
-from typing import Protocol, runtime_checkable
+from typing import Optional, Protocol, runtime_checkable
 
 import numpy as np
 
@@ -42,7 +42,13 @@ except Exception as exc:  # pragma: no cover - exercised only without torch
         "is usable without it."
     ) from exc
 
-__all__ = ["ARBackbone", "resize_token_embedding", "resize_output_head", "MASCObjective"]
+__all__ = [
+    "ARBackbone",
+    "resize_token_embedding",
+    "resize_output_head",
+    "MASCObjective",
+    "apply_masc_and_upipe",
+]
 
 
 @runtime_checkable
@@ -134,3 +140,79 @@ class MASCObjective:
         return torch.nn.functional.cross_entropy(
             logits.reshape(-1, logits.shape[-1]), target.reshape(-1)
         )
+
+
+# ---------------------------------------------------------------------------
+# Combined MASC + UPipe surgery (convenience entry point)
+# ---------------------------------------------------------------------------
+
+def apply_masc_and_upipe(
+    model: "nn.Module",
+    adapter: "ARBackbone",
+    mapping: "np.ndarray",
+    k: int,
+    upipe_chunk_heads: Optional[int] = None,
+    upipe_use_flash: bool = True,
+    attn_submodule_names: tuple = ("attention", "self_attn", "attn"),
+) -> "UPipeRegistry":
+    """Apply MASC vocabulary surgery and (optionally) UPipe attention patching.
+
+    Call this *once* after the model is on device, before the optimiser is
+    created.  The correct application order is:
+
+    1. MASC: resize embedding table + output head to k-way coarse vocab.
+    2. UPipe: wrap every attention layer for head-chunked execution.
+
+    Order matters: UPipe must see the already-resized model so it can
+    detect head attributes correctly.
+
+    Parameters
+    ----------
+    model:
+        The backbone ``nn.Module`` (must already be on device).
+    adapter:
+        :class:`ARBackbone` adapter for *model*.
+    mapping:
+        MASC token mapping array (``MASCMapping.mapping``, shape ``[N]``).
+    k:
+        Target coarse vocabulary size.
+    upipe_chunk_heads:
+        Q-heads per UPipe pipeline stage.  Pass ``None`` to skip UPipe
+        (MASC-only mode).  Rule of thumb: ``num_heads // 4``.
+    upipe_use_flash:
+        Use PyTorch SDPA (Flash-Attention 2) per chunk.
+    attn_submodule_names:
+        Attention submodule names to search; forwarded to
+        :func:`~masc.upipe_attention.patch_upipe_attention`.
+
+    Returns
+    -------
+    dict
+        UPipe registry (empty dict when UPipe is disabled).  Pass to
+        :func:`~masc.upipe_attention.unpatch_upipe_attention` to undo.
+    """
+    # Step 1 — MASC: vocabulary surgery
+    resize_token_embedding(adapter, k)
+    resize_output_head(adapter, k)
+    print(f"[MASC+UPipe] MASC surgery done: vocab {mapping.shape[0]} → k={k}")
+
+    # Step 2 — UPipe: attention patching (optional)
+    registry: dict = {}
+    if upipe_chunk_heads is not None:
+        from masc.upipe_attention import patch_upipe_attention
+        registry = patch_upipe_attention(
+            model,
+            chunk_heads=upipe_chunk_heads,
+            use_flash=upipe_use_flash,
+            attn_submodule_names=attn_submodule_names,
+            _registry=registry,
+        )
+        print(f"[MASC+UPipe] UPipe patching done: {len(registry)} layers wrapped.")
+    else:
+        print("[MASC+UPipe] UPipe disabled (upipe_chunk_heads=None).")
+
+    return registry
+
+
+# Type alias for the registry dict (for readability in user code)
+UPipeRegistry = dict

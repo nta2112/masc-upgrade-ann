@@ -25,10 +25,27 @@ from .clustering import MASCTree, build_masc_tree
 from .mapping import MASCMapping, invert_mapping, load_mapping, save_mapping
 from .relabel import relabel_targets
 from .decode import random_sample_decode
+# Integration (requires PyTorch) — imported lazily only when torch is present
+try:
+    from .integration import (
+        ARBackbone,
+        resize_token_embedding,
+        resize_output_head,
+        MASCObjective,
+        apply_masc_and_upipe,
+    )
+    from .upipe_attention import (
+        UPipeAttentionWrapper,
+        patch_upipe_attention,
+        unpatch_upipe_attention,
+    )
+except ImportError:
+    pass  # torch not installed; numpy-only core still available
 
 __version__ = "1.0.0"
 
 __all__ = [
+    # numpy core
     "average_linkage_distance",
     "pairwise_euclidean",
     "MASCTree",
@@ -39,5 +56,15 @@ __all__ = [
     "save_mapping",
     "relabel_targets",
     "random_sample_decode",
+    # torch integration
+    "ARBackbone",
+    "resize_token_embedding",
+    "resize_output_head",
+    "MASCObjective",
+    "apply_masc_and_upipe",
+    # UPipe attention
+    "UPipeAttentionWrapper",
+    "patch_upipe_attention",
+    "unpatch_upipe_attention",
     "__version__",
 ]

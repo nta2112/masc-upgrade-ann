@@ -93,10 +93,21 @@ class CodeDataset:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Train AR generator + MASC prior.")
-    ap.add_argument("--config", required=True, help="YAML config (see configs/).")
-    ap.add_argument("--mapping", required=True, help="MASC mapping .npz from build_masc_tree.py")
-    ap.add_argument("--codes", required=True, help="Directory of pre-extracted tokenizer codes.")
-    ap.add_argument("--out", required=True, help="Checkpoint output directory.")
+    ap.add_argument("--config",   required=True, help="YAML config (see configs/).")
+    ap.add_argument("--mapping",  required=True, help="MASC mapping .npz from build_masc_tree.py")
+    ap.add_argument("--codes",    required=True, help="Directory of pre-extracted tokenizer codes.")
+    ap.add_argument("--out",      required=True, help="Checkpoint output directory.")
+    # UPipe flags (override config; 0 = disable)
+    ap.add_argument("--upipe-chunk-heads", type=int, default=None,
+                    help="Q-heads per UPipe stage (None = disable UPipe, use MASC only).")
+    ap.add_argument("--no-flash",  action="store_true",
+                    help="Disable Flash-Attention 2 within each UPipe chunk.")
+    # Gradient checkpointing (saves ~30%% VRAM at ~20%% speed cost)
+    ap.add_argument("--grad-ckpt", action="store_true",
+                    help="Enable gradient checkpointing on transformer layers.")
+    # Resume from a previous checkpoint
+    ap.add_argument("--resume", default=None,
+                    help="Path to checkpoint .pt file to resume from.")
     args = ap.parse_args()
 
     import torch
@@ -128,8 +139,35 @@ def main() -> None:
 
     model, adapter = build_backbone(cfg["backbone"])
     model = model.to(device)
-    resize_token_embedding(adapter, mp.k)   # k-row embedding table
-    resize_output_head(adapter, mp.k)       # k-way logits
+
+    # --- Gradient checkpointing (optional, saves ~30% VRAM) -----------------
+    if args.grad_ckpt:
+        if hasattr(model, "gradient_checkpointing_enable"):
+            model.gradient_checkpointing_enable()
+            print("[train] Gradient checkpointing enabled (HuggingFace API).")
+        else:
+            # Generic fallback: apply torch.utils.checkpoint to each layer
+            from torch.utils.checkpoint import checkpoint_sequential
+            print("[train] gradient_checkpointing_enable() not found; "
+                  "use torch.utils.checkpoint manually in your adapter.")
+
+    # --- MASC + UPipe surgery (in correct order) ----------------------------
+    # Resolve UPipe settings: CLI flag overrides config
+    chunk_heads = args.upipe_chunk_heads
+    if chunk_heads is None:
+        upipe_cfg = cfg.get("upipe", {})
+        chunk_heads = upipe_cfg.get("chunk_heads", None) if upipe_cfg.get("enabled", False) else None
+    use_flash = not args.no_flash
+
+    from masc.integration import apply_masc_and_upipe
+    _upipe_registry = apply_masc_and_upipe(
+        model=model,
+        adapter=adapter,
+        mapping=mp.mapping,
+        k=mp.k,
+        upipe_chunk_heads=chunk_heads,
+        upipe_use_flash=use_flash,
+    )
 
     # --- Data / optim -------------------------------------------------------
     ds = CodeDataset(args.codes)
@@ -144,9 +182,21 @@ def main() -> None:
     grad_clip = train_cfg.get("grad_clip", 1.0)
     scaler = torch.cuda.amp.GradScaler(enabled=train_cfg.get("amp", True))
 
+    # --- Resume from checkpoint if requested --------------------------------
+    start_step = 0
+    if args.resume:
+        ckpt = torch.load(args.resume, map_location=device)
+        model.load_state_dict(ckpt["model"])
+        start_step = ckpt.get("step", 0)
+        if "optimizer" in ckpt:
+            opt.load_state_dict(ckpt["optimizer"])
+        if "scaler" in ckpt:
+            scaler.load_state_dict(ckpt["scaler"])
+        print(f"[train] Resumed from step {start_step} ({args.resume})")
+
     os.makedirs(args.out, exist_ok=True)
     model.train()
-    step = 0
+    step = start_step
     while step < total_steps:
         for codes, label in loader:
             codes = torch.as_tensor(codes, device=device)   # [B, L] fine z^q
@@ -169,10 +219,17 @@ def main() -> None:
             scaler.update()
 
             if step % cfg.get("log_every", 50) == 0:
-                print(f"[train] step {step}/{total_steps}  loss={loss.item():.4f}")
+                print(f"[train] step {step}/{total_steps}  loss={loss.item():.4f}",
+                      flush=True)
             if step > 0 and step % train_cfg.get("ckpt_every", 10000) == 0:
-                torch.save({"model": model.state_dict(), "step": step},
-                           os.path.join(args.out, f"ckpt_{step}.pt"))
+                torch.save({
+                    "model":     model.state_dict(),
+                    "optimizer": opt.state_dict(),
+                    "scaler":    scaler.state_dict(),
+                    "step":      step,
+                    "upipe_chunk_heads": chunk_heads,
+                    "masc_k":    mp.k,
+                }, os.path.join(args.out, f"ckpt_{step}.pt"))
             step += 1
             if step >= total_steps:
                 break

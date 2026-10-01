@@ -4,7 +4,7 @@ Reference implementation for the ICML 2026 paper
 **“A Flat Vocabulary or a Rich Hierarchy? Re-introducing Intrinsic Structure
 Transforms the Autoregressive Image Generation.”**
 
-📄 [Paper](docs/static/MASC_paper.pdf) &nbsp;|&nbsp; 🌐 [Project Page](https://lixuan27.github.io/MASC/) &nbsp;|&nbsp; 💻 [GitHub](https://github.com/lixuan27/MASC)
+📄 [Paper](docs/static/MASC_paper.pdf) &nbsp;|&nbsp; 🌐 [Project Page](https://lixuan27.github.io/MASC/) &nbsp;|&nbsp; 💻 [GitHub](https://github.com/nta2112/masc-upgrade-ann)
 
 > **TL;DR.** Discrete autoregressive (AR) image generators predict over a vast,
 > *flat* vocabulary of visual tokens, ignoring the fact that the codebook
@@ -21,7 +21,7 @@ Transforms the Autoregressive Image Generation.”**
 ## Install
 
 ```bash
-git clone <this-repo> MASC && cd MASC
+git clone https://github.com/nta2112/masc-upgrade-ann MASC && cd MASC
 python -m pip install -r requirements.txt   # numpy/scipy required; torch for training
 ```
 
@@ -89,3 +89,56 @@ AR sampling loop — is the **unmodified backbone**.
   year      = {2026}
 }
 ```
+
+---
+
+## MASC + UPipe Integration (this fork)
+
+This repository extends the original MASC with **UPipe** (Untied Ulysses
+head-chunked attention execution), enabling training on consumer GPUs such as
+Kaggle 2× T4 16 GB — without changing the mathematical result of attention.
+
+### What's new
+
+| Module | Description |
+|---|---|
+| `masc/upipe_attention.py` | `UPipeAttentionWrapper`, `patch_upipe_attention()`, `unpatch_upipe_attention()` |
+| `masc/integration.py` | `apply_masc_and_upipe()` — single entry point for both surgeries |
+| `configs/llamagen_l_masc_upipe_kaggle.yaml` | Kaggle-optimised config (T4 16 GB, batch 8, grad accum 16) |
+| `scripts/train.py` | New flags: `--upipe-chunk-heads`, `--grad-ckpt`, `--resume` |
+| `docs/kaggle_guide.md` | Step-by-step Kaggle notebook setup |
+
+### Quick start (MASC + UPipe combined)
+
+```python
+from masc import load_mapping
+from masc.integration import apply_masc_and_upipe
+
+mp = load_mapping("masc_mapping_k4096.npz")
+
+# Step 1+2 in one call: MASC vocab surgery → then UPipe attention patching
+registry = apply_masc_and_upipe(
+    model=model,
+    adapter=adapter,          # your ARBackbone adapter
+    mapping=mp.mapping,
+    k=mp.k,                   # 4096 for Kaggle T4
+    upipe_chunk_heads=4,      # LlamaGen-L has 16 heads → 4 stages → ~4× VRAM saving
+    upipe_use_flash=True,
+)
+```
+
+### Train command (Kaggle 2× T4)
+
+```bash
+python scripts/train.py \
+  --config configs/llamagen_l_masc_upipe_kaggle.yaml \
+  --mapping /kaggle/working/masc_mapping_k4096.npz \
+  --codes /kaggle/input/imagenet-tokens/codes/ \
+  --out /kaggle/working/checkpoints/ \
+  --upipe-chunk-heads 4 \
+  --grad-ckpt \
+  --resume /kaggle/input/llamagen-weights/c2i_L_256.pt
+```
+
+See [`docs/kaggle_guide.md`](docs/kaggle_guide.md) for the complete step-by-step
+setup including dataset preparation and VRAM budget analysis.

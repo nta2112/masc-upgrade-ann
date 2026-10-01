@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "masc"
-version = "1.0.0"
-description = "Manifold-Aligned Semantic Clustering — reference implementation (ICML 2026)"
+version = "1.1.0"
+description = "MASC + UPipe: Manifold-Aligned Semantic Clustering with memory-efficient attention (ICML 2026 + UPipe fork)"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { file = "LICENSE" }
@@ -13,6 +13,14 @@ authors = [
   { name = "Lixuan He" },
   { name = "Shikang Zheng" },
 ]
+maintainers = [
+  { name = "nta2112", email = "" },
+]
+keywords = ["image-generation", "autoregressive", "transformer", "VRAM", "clustering"]
+
+[project.urls]
+Repository = "https://github.com/nta2112/masc-upgrade-ann"
+
 dependencies = ["numpy>=1.23"]
 
 [project.optional-dependencies]
@@ -20,6 +28,8 @@ dependencies = ["numpy>=1.23"]
 full = ["torch>=2.1", "torchvision>=0.16", "pyyaml>=6.0", "torch-fidelity>=0.3.0"]
 test = ["scipy>=1.9", "pytest>=7.0"]
 demo = ["matplotlib>=3.6"]
+# Kaggle / multi-GPU training extras
+kaggle = ["torch>=2.1", "torchvision>=0.16", "pyyaml>=6.0", "accelerate>=0.27"]
 
 [tool.setuptools]
 packages = ["masc"]
