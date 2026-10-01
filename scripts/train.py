@@ -66,10 +66,12 @@ def cosine_lr(step, total_steps, peak_lr, final_lr, warmup_steps=0):
 class CodeDataset:
     """Pre-extracted tokenizer codes ``z^q`` (+ class labels) on disk.
 
-    Expects a directory of ``.npy`` shards, each ``[B, L]`` int token indices,
-    plus a parallel ``labels.npy``.  Producing these from the tokenizer is a
-    backbone-repo step (``docs/reproduction.md``); caching codes is standard
-    practice and keeps the tokenizer out of the training loop.
+    Supports:
+    1. Multi-sample shards (recommended): each ``shard_*.npy`` is ``[S, L]``,
+       with parallel ``labels.npy`` of shape ``[total_samples]``.
+       Dataset exposes sample-level indexing, enabling standard batching and shuffling.
+    2. Pre-batched shards (legacy): each ``.npy`` is ``[B, L]``, with
+       parallel ``labels.npy`` of shape ``[num_shards, B]``.
     """
 
     def __init__(self, code_dir: str):
@@ -84,11 +86,26 @@ class CodeDataset:
             )
         self.labels = np.load(os.path.join(code_dir, "labels.npy"))
 
-    def __len__(self):
-        return len(self.files)
+        first_shard = np.load(self.files[0], mmap_mode="r")
+        if first_shard.ndim == 2 and first_shard.shape[0] > 1 and len(self.labels) > len(self.files):
+            self.is_sharded = True
+            self.mmaps = [np.load(f, mmap_mode="r") for f in self.files]
+            self.shard_lengths = [m.shape[0] for m in self.mmaps]
+            self.cum_lengths = np.cumsum([0] + self.shard_lengths)
+            self.total_len = int(self.cum_lengths[-1])
+        else:
+            self.is_sharded = False
+            self.total_len = len(self.files)
 
-    def __getitem__(self, i):
-        return np.load(self.files[i]), self.labels[i]
+    def __len__(self):
+        return self.total_len
+
+    def __getitem__(self, idx):
+        if self.is_sharded:
+            shard_idx = int(np.searchsorted(self.cum_lengths[1:], idx, side="right"))
+            local_idx = idx - self.cum_lengths[shard_idx]
+            return self.mmaps[shard_idx][local_idx].astype(np.int64), int(self.labels[idx])
+        return np.load(self.files[idx]), self.labels[idx]
 
 
 def main() -> None:
@@ -111,24 +128,42 @@ def main() -> None:
     args = ap.parse_args()
 
     import torch
-    from torch.utils.data import DataLoader
+    import torch.distributed as dist
+    from torch.nn.parallel import DistributedDataParallel as DDP
+    from torch.utils.data import DataLoader, DistributedSampler
 
     from masc import load_mapping
     from masc.integration import resize_token_embedding, resize_output_head, MASCObjective
 
     cfg = load_config(args.config)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # --- Distributed setup ---
+    if "LOCAL_RANK" in os.environ:
+        local_rank = int(os.environ["LOCAL_RANK"])
+        world_size = int(os.environ.get("WORLD_SIZE", 1))
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+        if not dist.is_initialized():
+            dist.init_process_group(backend="nccl")
+        is_ddp = world_size > 1
+        is_main = local_rank == 0
+    else:
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        local_rank = 0
+        world_size = 1
+        is_ddp = False
+        is_main = True
 
     # --- MASC prior ---------------------------------------------------------
     mp = load_mapping(args.mapping)
     assert mp.k == cfg["masc"]["k"], (mp.k, cfg["masc"]["k"])
     objective = MASCObjective(mp.mapping, device=device)
-    print(f"[train] MASC mapping: N={mp.n} -> k={mp.k}")
+    if is_main:
+        print(f"[train] MASC mapping: N={mp.n} -> k={mp.k}")
 
     # --- Backbone (from the official repo, via your adapter) ----------------
-    # The adapter implements masc.integration.ARBackbone for your generator.
     try:
-        from backbones import build_backbone  # provided by the user; see docs
+        from backbones import build_backbone
     except ImportError as e:
         raise SystemExit(
             "Could not import `backbones.build_backbone`. MASC is plug-and-play: "
@@ -144,15 +179,13 @@ def main() -> None:
     if args.grad_ckpt:
         if hasattr(model, "gradient_checkpointing_enable"):
             model.gradient_checkpointing_enable()
-            print("[train] Gradient checkpointing enabled (HuggingFace API).")
+            if is_main:
+                print("[train] Gradient checkpointing enabled (HuggingFace API).")
         else:
-            # Generic fallback: apply torch.utils.checkpoint to each layer
-            from torch.utils.checkpoint import checkpoint_sequential
-            print("[train] gradient_checkpointing_enable() not found; "
-                  "use torch.utils.checkpoint manually in your adapter.")
+            if is_main:
+                print("[train] gradient_checkpointing_enable() not found on model.")
 
     # --- MASC + UPipe surgery (in correct order) ----------------------------
-    # Resolve UPipe settings: CLI flag overrides config
     chunk_heads = args.upipe_chunk_heads
     if chunk_heads is None:
         upipe_cfg = cfg.get("upipe", {})
@@ -169,11 +202,34 @@ def main() -> None:
         upipe_use_flash=use_flash,
     )
 
+    # --- DDP wrapper --------------------------------------------------------
+    if is_ddp:
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+
     # --- Data / optim -------------------------------------------------------
     ds = CodeDataset(args.codes)
-    loader = DataLoader(ds, batch_size=None, shuffle=True,
-                        num_workers=cfg.get("num_workers", 8), pin_memory=True,
-                        persistent_workers=True)
+    local_batch = cfg["train"].get("local_batch_size", 8)
+    if ds.is_sharded:
+        sampler = DistributedSampler(ds, shuffle=True) if is_ddp else None
+        loader = DataLoader(
+            ds, batch_size=local_batch,
+            shuffle=(sampler is None),
+            sampler=sampler,
+            num_workers=min(4, os.cpu_count() or 1),
+            pin_memory=True,
+            drop_last=True
+        )
+    else:
+        sampler = DistributedSampler(ds, shuffle=True) if is_ddp else None
+        loader = DataLoader(
+            ds, batch_size=None,
+            shuffle=(sampler is None),
+            sampler=sampler,
+            num_workers=min(4, os.cpu_count() or 1),
+            pin_memory=True,
+            persistent_workers=True
+        )
+
     opt = build_optimizer(model, cfg)
     train_cfg = cfg["train"]
     total_steps = train_cfg["total_steps"]
@@ -184,33 +240,43 @@ def main() -> None:
 
     # --- Resume from checkpoint if requested --------------------------------
     start_step = 0
-    if args.resume:
+    if args.resume and os.path.exists(args.resume) and "c2i_" not in os.path.basename(args.resume):
         ckpt = torch.load(args.resume, map_location=device)
-        model.load_state_dict(ckpt["model"])
+        raw_model = model.module if hasattr(model, "module") else model
+        raw_model.load_state_dict(ckpt["model"])
         start_step = ckpt.get("step", 0)
         if "optimizer" in ckpt:
             opt.load_state_dict(ckpt["optimizer"])
         if "scaler" in ckpt:
             scaler.load_state_dict(ckpt["scaler"])
-        print(f"[train] Resumed from step {start_step} ({args.resume})")
+        if is_main:
+            print(f"[train] Resumed from step {start_step} ({args.resume})")
 
-    os.makedirs(args.out, exist_ok=True)
+    if is_main:
+        os.makedirs(args.out, exist_ok=True)
     model.train()
     step = start_step
+
     while step < total_steps:
+        if is_ddp and sampler is not None:
+            sampler.set_epoch(step)
         for codes, label in loader:
             codes = torch.as_tensor(codes, device=device)   # [B, L] fine z^q
             label = torch.as_tensor(label, device=device)
             for g in opt.param_groups:
                 g["lr"] = cosine_lr(step, total_steps, peak_lr, final_lr)
             with torch.cuda.amp.autocast(enabled=train_cfg.get("amp", True)):
-                # The backbone consumes coarse inputs; targets are relabelled by
-                # MASCObjective.  `model.forward_for_masc` is the one method your
-                # adapter must route to the backbone's causal forward over the
-                # coarse vocabulary (see docs/reproduction.md).
                 coarse_in = objective.coarse_targets(codes)
-                logits = model.forward_for_masc(coarse_in, class_labels=label)
+                # DDP-compatible forward call
+                if hasattr(model, "forward_for_masc"):
+                    logits = model.forward_for_masc(coarse_in, class_labels=label)
+                else:
+                    out = model(coarse_in, label)
+                    logits = out[0] if isinstance(out, tuple) else out
+                    if logits.shape[1] > coarse_in.shape[1]:
+                        logits = logits[:, :coarse_in.shape[1], :]
                 loss = objective.loss(logits, codes)
+
             opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
@@ -218,12 +284,13 @@ def main() -> None:
             scaler.step(opt)
             scaler.update()
 
-            if step % cfg.get("log_every", 50) == 0:
+            if is_main and step % cfg.get("log_every", 50) == 0:
                 print(f"[train] step {step}/{total_steps}  loss={loss.item():.4f}",
                       flush=True)
-            if step > 0 and step % train_cfg.get("ckpt_every", 10000) == 0:
+            if is_main and step > 0 and step % train_cfg.get("ckpt_every", 10000) == 0:
+                raw_model = model.module if hasattr(model, "module") else model
                 torch.save({
-                    "model":     model.state_dict(),
+                    "model":     raw_model.state_dict(),
                     "optimizer": opt.state_dict(),
                     "scaler":    scaler.state_dict(),
                     "step":      step,
@@ -234,9 +301,14 @@ def main() -> None:
             if step >= total_steps:
                 break
 
-    torch.save({"model": model.state_dict(), "step": step},
-               os.path.join(args.out, "ckpt_final.pt"))
-    print("[train] done.")
+    if is_main:
+        raw_model = model.module if hasattr(model, "module") else model
+        torch.save({"model": raw_model.state_dict(), "step": step},
+                   os.path.join(args.out, "ckpt_final.pt"))
+        print("[train] done.")
+
+    if is_ddp:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

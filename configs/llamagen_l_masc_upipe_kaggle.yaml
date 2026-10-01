@@ -1,4 +1,4 @@
-﻿# LlamaGen-L + MASC + UPipe — Kaggle Free Tier (2× T4 16 GB each)
+# LlamaGen-L + MASC + UPipe — Kaggle Free Tier (2× T4 16 GB each)
 # ---------------------------------------------------------------
 # Designed for proof-of-concept fine-tuning from a pretrained
 # LlamaGen-L checkpoint (c2i_L_256.pt, ~1.4 GB) on pre-extracted
@@ -16,7 +16,7 @@ backbone:
   params: 343M
   image_size: 256
   tokenizer: llamagen_vq16384
-  pretrained: /kaggle/input/llamagen-weights/c2i_L_256.pt  # Kaggle dataset path
+  pretrained: /kaggle/working/weights/c2i_L_256.pt  # Auto-downloaded by Cell 2
 
 masc:
   k: 4096              # Smaller than paper's 8192 → saves ~70MB embedding VRAM
