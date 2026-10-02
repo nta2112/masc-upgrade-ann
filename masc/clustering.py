@@ -57,6 +57,11 @@ class MASCTree:
     sizes: np.ndarray
     merge_history: np.ndarray
 
+    @property
+    def n(self) -> int:
+        """Total number of fine vocabulary tokens."""
+        return int(self.mapping.shape[0])
+
 
 def _find(parent: np.ndarray, i: int) -> int:
     """Union-find root with path compression (tracks token -> active slot)."""
