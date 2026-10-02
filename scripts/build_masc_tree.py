@@ -51,7 +51,9 @@ def load_codebook(path: str) -> np.ndarray:
         if hasattr(obj, "numpy"):
             x = obj.detach().cpu().numpy()
         else:
-            cand = [v for k, v in obj.items() if "embedding" in k.lower()]
+            if isinstance(obj, dict) and ("model" in obj or "ema" in obj):
+                obj = obj.get("model", obj.get("ema", obj))
+            cand = [v for k, v in obj.items() if "embedding" in k.lower() or "codebook" in k.lower()]
             if not cand:
                 raise KeyError(
                     "Could not locate a codebook embedding in the checkpoint; "

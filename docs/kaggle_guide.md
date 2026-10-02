@@ -1,4 +1,4 @@
-﻿# Hướng Dẫn Chạy MASC + UPipe trên Kaggle (2× T4 16 GB)
+# Hướng Dẫn Chạy MASC + UPipe trên Kaggle (2× T4 16 GB)
 
 Tài liệu này hướng dẫn đầy đủ từng bước để chạy MASC + UPipe trên
 Kaggle Free Tier với 2× NVIDIA T4 (mỗi GPU 16 GB VRAM).
@@ -153,7 +153,8 @@ else:
     vq_model = VQ_models["VQ-16"](codebook_size=16384, codebook_embed_dim=8)
     ckpt = torch.load("/kaggle/input/llamagen-weights/vq_ds16_c2i.pt",
                       map_location="cpu")
-    vq_model.load_state_dict(ckpt)
+    state = ckpt.get("model", ckpt.get("ema", ckpt))
+    vq_model.load_state_dict(state, strict=False)
     # Extract codebook embeddings [N, d_vq]
     codebook = vq_model.quantize.embedding.weight.detach().cpu().numpy()
     print(f"Codebook shape: {codebook.shape}")  # (16384, 8)
