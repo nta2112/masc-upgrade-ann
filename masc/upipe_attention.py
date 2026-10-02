@@ -123,8 +123,8 @@ class UPipeAttentionWrapper(nn.Module):
     # ------------------------------------------------------------------
 
     def forward(self, *args, **kwargs) -> torch.Tensor:
-        # If wrapped module has wq and wo, it is a full attention module (e.g. LLaMA/LlamaGen)
-        if hasattr(self._original, "wq") and hasattr(self._original, "wo"):
+        # If wrapped module has wqkv (LlamaGen) or (wq and wo) (standard LLaMA), it is a full attention module
+        if (hasattr(self._original, "wqkv") or hasattr(self._original, "wq")) and hasattr(self._original, "wo"):
             return self._forward_llamagen(*args, **kwargs)
         return self._forward_sdpa(*args, **kwargs)
 
@@ -139,9 +139,14 @@ class UPipeAttentionWrapper(nn.Module):
         orig = self._original
         bsz, seqlen, _ = x.shape
 
-        xq = orig.wq(x)
-        xk = orig.wk(x)
-        xv = orig.wv(x)
+        if hasattr(orig, "wqkv"):
+            kv_size = self.num_kv_heads * self.head_dim
+            dim = self.num_q_heads * self.head_dim
+            xq, xk, xv = orig.wqkv(x).split([dim, kv_size, kv_size], dim=-1)
+        else:
+            xq = orig.wq(x)
+            xk = orig.wk(x)
+            xv = orig.wv(x)
 
         xq = xq.view(bsz, seqlen, self.num_q_heads, self.head_dim)
         xk = xk.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
@@ -150,38 +155,41 @@ class UPipeAttentionWrapper(nn.Module):
         if freqs_cis is not None:
             try:
                 from autoregressive.models.gpt import apply_rotary_emb
-                xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+                xq = apply_rotary_emb(xq, freqs_cis)
+                xk = apply_rotary_emb(xk, freqs_cis)
             except Exception:
-                pass
+                try:
+                    from autoregressive.models.gpt import apply_rotary_emb
+                    xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+                except Exception:
+                    pass
 
-        if hasattr(orig, "kv_cache") and orig.kv_cache is not None and start_pos is not None:
-            xk, xv = orig.kv_cache.update(start_pos, xk, xv)
+        xq, xk, xv = map(lambda t: t.transpose(1, 2), (xq, xk, xv))
 
-        xq = xq.transpose(1, 2)
-        xk = xk.transpose(1, 2)
-        xv = xv.transpose(1, 2)
+        if hasattr(orig, "kv_cache") and orig.kv_cache is not None:
+            keys, values = orig.kv_cache.update(start_pos, xk, xv)
+        else:
+            keys, values = xk, xv
+
+        if self.num_q_heads != self.num_kv_heads:
+            keys = keys.repeat_interleave(self.num_q_heads // self.num_kv_heads, dim=1)
+            values = values.repeat_interleave(self.num_q_heads // self.num_kv_heads, dim=1)
 
         out = torch.empty_like(xq)
         for q_start in range(0, self.num_q_heads, self.chunk_heads):
             q_end = min(q_start + self.chunk_heads, self.num_q_heads)
             q_chunk = xq[:, q_start:q_end]
+            k_chunk = keys[:, q_start:q_end]
+            v_chunk = values[:, q_start:q_end]
 
-            kv_start = q_start // self._gqa_ratio
-            kv_end = max(kv_start + 1, min((q_end + self._gqa_ratio - 1) // self._gqa_ratio, self.num_kv_heads))
-            k_chunk = xk[:, kv_start:kv_end]
-            v_chunk = xv[:, kv_start:kv_end]
-
-            kv_repeat = (q_end - q_start) // (kv_end - kv_start)
-            if kv_repeat > 1:
-                k_chunk = k_chunk.repeat_interleave(kv_repeat, dim=1)
-                v_chunk = v_chunk.repeat_interleave(kv_repeat, dim=1)
+            dropout_p = getattr(orig, "attn_dropout_p", 0.0) if orig.training else 0.0
+            is_causal = True if mask is None else False
 
             if self.use_flash:
-                is_causal = (mask is None and seqlen > 1 and (start_pos is None or start_pos == 0))
                 chunk_out = F.scaled_dot_product_attention(
                     q_chunk, k_chunk, v_chunk,
                     attn_mask=mask,
-                    dropout_p=getattr(orig, "dropout_p", 0.0) if orig.training else 0.0,
+                    dropout_p=dropout_p,
                     is_causal=is_causal,
                 )
             else:
@@ -191,7 +199,10 @@ class UPipeAttentionWrapper(nn.Module):
             del q_chunk, k_chunk, v_chunk, chunk_out
 
         out = out.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
-        return orig.wo(out)
+        output = orig.wo(out)
+        if hasattr(orig, "resid_dropout"):
+            output = orig.resid_dropout(output)
+        return output
 
     def _forward_sdpa(
         self,
