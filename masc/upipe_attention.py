@@ -110,11 +110,90 @@ class UPipeAttentionWrapper(nn.Module):
         # GQA ratio: how many Q heads share each K/V head
         self._gqa_ratio = max(1, num_q_heads // num_kv_heads)
 
+    def __getattr__(self, name: str):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            if "_original" in self.__dict__:
+                return getattr(self._original, name)
+            raise
+
     # ------------------------------------------------------------------
-    # Main forward — head-chunked SDPA
+    # Forward dispatch: LLaMA/LlamaGen module vs. low-level SDPA
     # ------------------------------------------------------------------
 
-    def forward(
+    def forward(self, *args, **kwargs) -> torch.Tensor:
+        # If wrapped module has wq and wo, it is a full attention module (e.g. LLaMA/LlamaGen)
+        if hasattr(self._original, "wq") and hasattr(self._original, "wo"):
+            return self._forward_llamagen(*args, **kwargs)
+        return self._forward_sdpa(*args, **kwargs)
+
+    def _forward_llamagen(
+        self,
+        x: torch.Tensor,
+        freqs_cis: Optional[torch.Tensor] = None,
+        start_pos: Optional[int] = None,
+        mask: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        orig = self._original
+        bsz, seqlen, _ = x.shape
+
+        xq = orig.wq(x)
+        xk = orig.wk(x)
+        xv = orig.wv(x)
+
+        xq = xq.view(bsz, seqlen, self.num_q_heads, self.head_dim)
+        xk = xk.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
+        xv = xv.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
+
+        if freqs_cis is not None:
+            try:
+                from autoregressive.models.gpt import apply_rotary_emb
+                xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+            except Exception:
+                pass
+
+        if hasattr(orig, "kv_cache") and orig.kv_cache is not None and start_pos is not None:
+            xk, xv = orig.kv_cache.update(start_pos, xk, xv)
+
+        xq = xq.transpose(1, 2)
+        xk = xk.transpose(1, 2)
+        xv = xv.transpose(1, 2)
+
+        out = torch.empty_like(xq)
+        for q_start in range(0, self.num_q_heads, self.chunk_heads):
+            q_end = min(q_start + self.chunk_heads, self.num_q_heads)
+            q_chunk = xq[:, q_start:q_end]
+
+            kv_start = q_start // self._gqa_ratio
+            kv_end = max(kv_start + 1, min((q_end + self._gqa_ratio - 1) // self._gqa_ratio, self.num_kv_heads))
+            k_chunk = xk[:, kv_start:kv_end]
+            v_chunk = xv[:, kv_start:kv_end]
+
+            kv_repeat = (q_end - q_start) // (kv_end - kv_start)
+            if kv_repeat > 1:
+                k_chunk = k_chunk.repeat_interleave(kv_repeat, dim=1)
+                v_chunk = v_chunk.repeat_interleave(kv_repeat, dim=1)
+
+            if self.use_flash:
+                is_causal = (mask is None and seqlen > 1 and (start_pos is None or start_pos == 0))
+                chunk_out = F.scaled_dot_product_attention(
+                    q_chunk, k_chunk, v_chunk,
+                    attn_mask=mask,
+                    dropout_p=getattr(orig, "dropout_p", 0.0) if orig.training else 0.0,
+                    is_causal=is_causal,
+                )
+            else:
+                chunk_out = self._manual_sdpa(q_chunk, k_chunk, v_chunk, mask)
+
+            out[:, q_start:q_end] = chunk_out
+            del q_chunk, k_chunk, v_chunk, chunk_out
+
+        out = out.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
+        return orig.wo(out)
+
+    def _forward_sdpa(
         self,
         q: torch.Tensor,           # [B, num_q_heads, L, head_dim]
         k: torch.Tensor,           # [B, num_kv_heads, L, head_dim]
@@ -253,10 +332,18 @@ def patch_upipe_attention(
                 continue  # already patched
 
             # Auto-detect head configuration from common attribute names
-            num_q_heads = _detect_attr(attn, ("num_heads", "n_heads", "num_attention_heads"))
+            num_q_heads = _detect_attr(
+                attn,
+                ("n_local_heads", "n_head", "num_heads", "n_heads", "num_attention_heads"),
+            )
+            if num_q_heads is None:
+                cfg = getattr(model, "config", getattr(layer, "config", None))
+                if cfg is not None:
+                    num_q_heads = getattr(cfg, "n_head", getattr(cfg, "num_heads", None))
+
             num_kv_heads = _detect_attr(
                 attn,
-                ("num_kv_heads", "num_key_value_heads", "n_kv_heads"),
+                ("n_local_kv_heads", "n_kv_heads", "num_kv_heads", "num_key_value_heads"),
                 default=num_q_heads,
             )
             head_dim = _detect_attr(attn, ("head_dim", "d_head"), default=None)
@@ -271,8 +358,12 @@ def patch_upipe_attention(
                 continue
 
             if head_dim is None:
-                embed_dim = _detect_attr(attn, ("embed_dim", "hidden_size", "d_model"))
-                head_dim = embed_dim // num_q_heads if embed_dim else None
+                if hasattr(attn, "wq") and hasattr(attn.wq, "out_features"):
+                    head_dim = attn.wq.out_features // num_q_heads
+                else:
+                    embed_dim = _detect_attr(attn, ("dim", "embed_dim", "hidden_size", "d_model"))
+                    head_dim = embed_dim // num_q_heads if embed_dim else None
+
             if head_dim is None:
                 import warnings
                 warnings.warn(
