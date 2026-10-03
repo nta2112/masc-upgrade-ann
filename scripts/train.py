@@ -27,6 +27,7 @@ RAR releases.  Everything below this line is generic and backbone-independent.
 from __future__ import annotations
 
 import argparse
+import glob
 import math
 import os
 import sys
@@ -241,16 +242,36 @@ def main() -> None:
     # --- Resume from checkpoint if requested --------------------------------
     start_step = 0
     if args.resume and os.path.exists(args.resume) and "c2i_" not in os.path.basename(args.resume):
-        ckpt = torch.load(args.resume, map_location=device)
-        raw_model = model.module if hasattr(model, "module") else model
-        raw_model.load_state_dict(ckpt["model"])
-        start_step = ckpt.get("step", 0)
-        if "optimizer" in ckpt:
-            opt.load_state_dict(ckpt["optimizer"])
-        if "scaler" in ckpt:
-            scaler.load_state_dict(ckpt["scaler"])
-        if is_main:
-            print(f"[train] Resumed from step {start_step} ({args.resume})")
+        try:
+            ckpt = torch.load(args.resume, map_location=device)
+            raw_model = model.module if hasattr(model, "module") else model
+            raw_model.load_state_dict(ckpt["model"])
+            start_step = ckpt.get("step", 0)
+            if "optimizer" in ckpt:
+                opt.load_state_dict(ckpt["optimizer"])
+            if "scaler" in ckpt:
+                scaler.load_state_dict(ckpt["scaler"])
+            if is_main:
+                print(f"[train] Resumed from step {start_step} ({args.resume})")
+        except Exception as e:
+            if is_main:
+                print(f"[train] WARNING: Failed to load {args.resume}: {e}")
+                all_ckpts = sorted(glob.glob(os.path.join(args.out, "ckpt_[0-9]*.pt")))
+                candidates = [c for c in all_ckpts if os.path.abspath(c) != os.path.abspath(args.resume)]
+                if candidates:
+                    fallback = candidates[-1]
+                    print(f"[train] Falling back to previous valid checkpoint: {fallback}")
+                    ckpt = torch.load(fallback, map_location=device)
+                    raw_model = model.module if hasattr(model, "module") else model
+                    raw_model.load_state_dict(ckpt["model"])
+                    start_step = ckpt.get("step", 0)
+                    if "optimizer" in ckpt:
+                        opt.load_state_dict(ckpt["optimizer"])
+                    if "scaler" in ckpt:
+                        scaler.load_state_dict(ckpt["scaler"])
+                    print(f"[train] Fallback successful! Resumed from step {start_step}")
+                else:
+                    raise
 
     if is_main:
         os.makedirs(args.out, exist_ok=True)
@@ -289,6 +310,8 @@ def main() -> None:
                       flush=True)
             if is_main and step > 0 and step % train_cfg.get("ckpt_every", 10000) == 0:
                 raw_model = model.module if hasattr(model, "module") else model
+                ckpt_dest = os.path.join(args.out, f"ckpt_{step}.pt")
+                ckpt_tmp = ckpt_dest + ".tmp"
                 torch.save({
                     "model":     raw_model.state_dict(),
                     "optimizer": opt.state_dict(),
@@ -296,7 +319,18 @@ def main() -> None:
                     "step":      step,
                     "upipe_chunk_heads": chunk_heads,
                     "masc_k":    mp.k,
-                }, os.path.join(args.out, f"ckpt_{step}.pt"))
+                }, ckpt_tmp)
+                os.replace(ckpt_tmp, ckpt_dest)
+                print(f"[train] Saved checkpoint: {ckpt_dest}")
+
+                # Keep only the last 2 checkpoints to avoid exceeding Kaggle disk quota
+                all_ckpts = sorted(glob.glob(os.path.join(args.out, "ckpt_[0-9]*.pt")))
+                for old_ck in all_ckpts[:-2]:
+                    try:
+                        os.remove(old_ck)
+                        print(f"[train] Removed old {os.path.basename(old_ck)} to free disk space")
+                    except Exception:
+                        pass
             step += 1
             if step >= total_steps:
                 break
