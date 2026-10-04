@@ -205,7 +205,7 @@ def main() -> None:
 
     # --- DDP wrapper --------------------------------------------------------
     if is_ddp:
-        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
 
     # --- Data / optim -------------------------------------------------------
     ds = CodeDataset(args.codes)

@@ -37,13 +37,13 @@ optimizer:
 
 train:
   epochs: null          # Use total_steps instead
-  total_steps: 8000     # ~1-1.2h on 2× T4 with batch 24 (48/step = 384k images)
-  global_batch_size: 48
-  local_batch_size: 24  # 24 per GPU × 2 GPUs = 48/step (~4-5 GB VRAM / 15.6 GB)
+  total_steps: 10000    # ~1.2h on 2× T4 with batch 16 (32/step = 320k images)
+  global_batch_size: 32
+  local_batch_size: 16  # 16 per GPU × 2 GPUs = 32/step (~7-8 GB VRAM, rock-solid)
   grad_clip: 1.0
   amp: true             # bf16 preferred; T4 uses fp16
   amp_dtype: float16
-  ckpt_every: 1000      # Save every 1000 steps (~8-10 min)
+  ckpt_every: 1000      # Save every 1000 steps (~7-8 min)
   grad_checkpointing: true
 
 num_workers: 2          # Kaggle has limited CPU cores
