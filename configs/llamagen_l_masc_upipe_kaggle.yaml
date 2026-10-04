@@ -17,6 +17,7 @@ backbone:
   image_size: 256
   tokenizer: llamagen_vq16384
   pretrained: /kaggle/working/weights/c2i_L_256.pt  # Auto-downloaded by Cell 2
+  freeze_layers: 20    # Freeze first 20 layers, only train top 4 layers + embeddings + head
 
 masc:
   k: 4096              # Smaller than paper's 8192 → saves ~70MB embedding VRAM
@@ -29,21 +30,21 @@ upipe:
 
 optimizer:
   name: adamw
-  peak_lr: 1.0e-4      # Optimal LR for fine-tuning with centroid init
-  final_lr: 1.0e-5
+  peak_lr: 2.0e-4      # Higher LR for fast head + 4 layers fine-tuning
+  final_lr: 2.0e-5
   betas: [0.9, 0.95]
   eps: 1.0e-8
   weight_decay: 0.05
 
 train:
   epochs: null          # Use total_steps instead
-  total_steps: 10000    # ~1.2h on 2× T4 with batch 16 (32/step = 320k images)
+  total_steps: 3500     # ~8-10 minutes on 2× T4 (0.15s/step = 3500 steps)
   global_batch_size: 32
-  local_batch_size: 16  # 16 per GPU × 2 GPUs = 32/step (~7-8 GB VRAM, rock-solid)
+  local_batch_size: 16  # 16 per GPU × 2 GPUs = 32/step (~4-5 GB VRAM with frozen backbone)
   grad_clip: 1.0
   amp: true             # bf16 preferred; T4 uses fp16
   amp_dtype: float16
-  ckpt_every: 1000      # Save every 1000 steps (~7-8 min)
+  ckpt_every: 1000      # Save every 1000 steps (~2.5-3 min)
   grad_checkpointing: true
 
 num_workers: 2          # Kaggle has limited CPU cores

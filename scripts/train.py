@@ -46,8 +46,9 @@ def load_config(path: str) -> dict:
 def build_optimizer(model, cfg):
     import torch
     opt_cfg = cfg["optimizer"]
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
     return torch.optim.AdamW(
-        model.parameters(),
+        trainable_params,
         lr=opt_cfg["peak_lr"],
         betas=tuple(opt_cfg.get("betas", (0.9, 0.95))),
         eps=float(opt_cfg.get("eps", 1e-8)),
@@ -203,6 +204,19 @@ def main() -> None:
         upipe_use_flash=use_flash,
     )
 
+    # --- Freeze backbone layers (optional fast fine-tuning) -----------------
+    freeze_layers = cfg.get("backbone", {}).get("freeze_layers", 0)
+    if freeze_layers > 0 and hasattr(model, "layers"):
+        num_layers = len(model.layers)
+        freeze_count = min(freeze_layers, num_layers)
+        for i in range(freeze_count):
+            for p in model.layers[i].parameters():
+                p.requires_grad = False
+        trainable_p = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total_p = sum(p.numel() for p in model.parameters())
+        if is_main:
+            print(f"[train] Frozen first {freeze_count}/{num_layers} layers! Trainable: {trainable_p/1e6:.1f}M / {total_p/1e6:.1f}M ({trainable_p/total_p*100:.1f}%)")
+
     # --- DDP wrapper --------------------------------------------------------
     if is_ddp:
         model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
@@ -210,15 +224,18 @@ def main() -> None:
     # --- Data / optim -------------------------------------------------------
     ds = CodeDataset(args.codes)
     local_batch = cfg["train"].get("local_batch_size", 8)
+    num_workers = min(4, os.cpu_count() or 1)
     if ds.is_sharded:
         sampler = DistributedSampler(ds, shuffle=True) if is_ddp else None
         loader = DataLoader(
             ds, batch_size=local_batch,
             shuffle=(sampler is None),
             sampler=sampler,
-            num_workers=min(4, os.cpu_count() or 1),
+            num_workers=num_workers,
             pin_memory=True,
-            drop_last=True
+            drop_last=True,
+            persistent_workers=(num_workers > 0),
+            prefetch_factor=2 if (num_workers > 0) else None,
         )
     else:
         sampler = DistributedSampler(ds, shuffle=True) if is_ddp else None
@@ -226,9 +243,10 @@ def main() -> None:
             ds, batch_size=None,
             shuffle=(sampler is None),
             sampler=sampler,
-            num_workers=min(4, os.cpu_count() or 1),
+            num_workers=num_workers,
             pin_memory=True,
-            persistent_workers=True
+            persistent_workers=(num_workers > 0),
+            prefetch_factor=2 if (num_workers > 0) else None,
         )
 
     opt = build_optimizer(model, cfg)
