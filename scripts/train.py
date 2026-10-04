@@ -323,9 +323,9 @@ def main() -> None:
                 os.replace(ckpt_tmp, ckpt_dest)
                 print(f"[train] Saved checkpoint: {ckpt_dest}")
 
-                # Keep only the last 2 checkpoints to avoid exceeding Kaggle disk quota
+                # Keep only the latest 1 checkpoint to avoid exceeding Kaggle disk quota
                 all_ckpts = sorted(glob.glob(os.path.join(args.out, "ckpt_[0-9]*.pt")))
-                for old_ck in all_ckpts[:-2]:
+                for old_ck in all_ckpts[:-1]:
                     try:
                         os.remove(old_ck)
                         print(f"[train] Removed old {os.path.basename(old_ck)} to free disk space")
@@ -337,8 +337,17 @@ def main() -> None:
 
     if is_main:
         raw_model = model.module if hasattr(model, "module") else model
-        torch.save({"model": raw_model.state_dict(), "step": step},
-                   os.path.join(args.out, "ckpt_final.pt"))
+        final_dest = os.path.join(args.out, "ckpt_final.pt")
+        torch.save({"model": raw_model.state_dict(), "step": step}, final_dest)
+        print(f"[train] Saved final checkpoint: {final_dest}")
+
+        # Clean up all intermediate checkpoints since final checkpoint is successfully saved
+        for old_ck in glob.glob(os.path.join(args.out, "ckpt_[0-9]*.pt")):
+            try:
+                os.remove(old_ck)
+                print(f"[train] Removed intermediate {os.path.basename(old_ck)} to free disk space")
+            except Exception:
+                pass
         print("[train] done.")
 
     if is_ddp:
