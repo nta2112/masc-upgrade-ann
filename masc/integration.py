@@ -28,7 +28,7 @@ This file requires PyTorch; the numpy MASC core (clustering / mapping / relabel
 
 from __future__ import annotations
 
-from typing import Optional, Protocol, runtime_checkable
+from typing import Optional, Protocol, Union, runtime_checkable
 
 import numpy as np
 
@@ -74,35 +74,107 @@ class ARBackbone(Protocol):
         ...
 
 
-def resize_token_embedding(backbone: "ARBackbone", k: int) -> None:
+def resize_token_embedding(
+    backbone: "ARBackbone",
+    k: int,
+    mapping: Optional[Union[np.ndarray, "torch.Tensor"]] = None,
+) -> None:
     """Replace the backbone's token-embedding table with a ``k``-row table.
 
-    The new table is freshly initialised (the coarse vocabulary is a different
-    index space from the fine one, so old rows are not transferable).  We follow
-    the backbone's own embedding dim and the common ``N(0, 0.02)`` init used by
-    the LLaMA-style generators evaluated in the paper; adjust to match your
-    backbone's convention if it differs.
+    If ``mapping`` (shape [N]) is provided and matches the old embedding's vocab size,
+    the new embedding rows are initialised as cluster centroids (the average of
+    pretrained token embeddings belonging to each cluster). This preserves pretrained
+    representations for fast fine-tuning.
+    Otherwise, falls back to normal initialisation N(0, 0.02).
     """
     old = backbone.get_token_embedding()
     new = nn.Embedding(k, old.embedding_dim)
-    nn.init.normal_(new.weight, mean=0.0, std=0.02)
+
+    initialized = False
+    if mapping is not None:
+        try:
+            m = torch.as_tensor(np.asarray(mapping), dtype=torch.int64, device=old.weight.device)
+            if m.shape[0] == old.weight.shape[0]:
+                counts = torch.bincount(m, minlength=k).float().unsqueeze(1)
+                old_w = old.weight.detach().to(dtype=torch.float32)
+                sum_w = torch.zeros(k, old.embedding_dim, device=old.weight.device, dtype=torch.float32)
+                sum_w.index_add_(0, m, old_w)
+                mask = (counts > 0)
+                centroid_w = torch.where(mask, sum_w / torch.clamp(counts, min=1.0), torch.zeros_like(sum_w))
+                if (~mask.squeeze(1)).any():
+                    rand_w = torch.randn_like(centroid_w) * 0.02
+                    centroid_w = torch.where(mask, centroid_w, rand_w)
+                new.weight.data.copy_(centroid_w.to(dtype=old.weight.dtype))
+                initialized = True
+                print(f"[MASC] Initialized token embeddings via cluster centroids (N={m.shape[0]} -> k={k}).")
+            else:
+                print(f"[MASC] Mapping size ({m.shape[0]}) != old vocab ({old.weight.shape[0]}), fallback to N(0, 0.02).")
+        except Exception as e:
+            print(f"[MASC] Warning: Centroid initialization failed ({e}), fallback to N(0, 0.02).")
+
+    if not initialized:
+        nn.init.normal_(new.weight, mean=0.0, std=0.02)
+        print(f"[MASC] Initialized token embeddings with N(0, 0.02) (k={k}).")
+
     new = new.to(old.weight.device, old.weight.dtype)
     backbone.set_token_embedding(new)
 
 
-def resize_output_head(backbone: "ARBackbone", k: int) -> None:
+def resize_output_head(
+    backbone: "ARBackbone",
+    k: int,
+    mapping: Optional[Union[np.ndarray, "torch.Tensor"]] = None,
+) -> None:
     """Replace the final projection so it emits ``k`` logits.
 
-    If your backbone ties the input embedding and output head, point both at the
-    same parameter after resizing (handled in your adapter).
+    If ``mapping`` (shape [N]) is provided and matches the old head's out_features,
+    the new head weights and bias are initialised as cluster centroid averages of the
+    pretrained head. This preserves pretrained classification capabilities for fine-tuning.
+    Otherwise, falls back to normal initialisation N(0, 0.02).
     """
     old = backbone.get_output_head()
     in_features = old.in_features
-    bias = old.bias is not None
-    new = nn.Linear(in_features, k, bias=bias)
-    nn.init.normal_(new.weight, mean=0.0, std=0.02)
-    if bias:
-        nn.init.zeros_(new.bias)
+    has_bias = old.bias is not None
+    new = nn.Linear(in_features, k, bias=has_bias)
+
+    initialized = False
+    if mapping is not None:
+        try:
+            m = torch.as_tensor(np.asarray(mapping), dtype=torch.int64, device=old.weight.device)
+            if m.shape[0] == old.weight.shape[0]:
+                counts = torch.bincount(m, minlength=k).float().unsqueeze(1)
+                old_w = old.weight.detach().to(dtype=torch.float32)
+                sum_w = torch.zeros(k, in_features, device=old.weight.device, dtype=torch.float32)
+                sum_w.index_add_(0, m, old_w)
+                mask = (counts > 0)
+                centroid_w = torch.where(mask, sum_w / torch.clamp(counts, min=1.0), torch.zeros_like(sum_w))
+                if (~mask.squeeze(1)).any():
+                    rand_w = torch.randn_like(centroid_w) * 0.02
+                    centroid_w = torch.where(mask, centroid_w, rand_w)
+                new.weight.data.copy_(centroid_w.to(dtype=old.weight.dtype))
+
+                if has_bias:
+                    old_b = old.bias.detach().to(dtype=torch.float32)
+                    sum_b = torch.zeros(k, device=old.weight.device, dtype=torch.float32)
+                    sum_b.index_add_(0, m, old_b)
+                    counts_b = counts.squeeze(1)
+                    mask_b = (counts_b > 0)
+                    centroid_b = torch.where(mask_b, sum_b / torch.clamp(counts_b, min=1.0), torch.zeros_like(sum_b))
+                    new.bias.data.copy_(centroid_b.to(dtype=old.bias.dtype))
+
+                initialized = True
+                print(f"[MASC] Initialized output head via cluster centroids (N={m.shape[0]} -> k={k}).")
+            else:
+                print(f"[MASC] Mapping size ({m.shape[0]}) != old head ({old.weight.shape[0]}), fallback to N(0, 0.02).")
+        except Exception as e:
+            print(f"[MASC] Warning: Centroid initialization failed ({e}), fallback to N(0, 0.02).")
+
+    if not initialized:
+        nn.init.normal_(new.weight, mean=0.0, std=0.02)
+        if has_bias:
+            nn.init.zeros_(new.bias)
+        print(f"[MASC] Initialized output head with N(0, 0.02) (k={k}).")
+
     new = new.to(old.weight.device, old.weight.dtype)
     backbone.set_output_head(new)
 
@@ -154,6 +226,7 @@ def apply_masc_and_upipe(
     upipe_chunk_heads: Optional[int] = None,
     upipe_use_flash: bool = True,
     attn_submodule_names: tuple = ("attention", "self_attn", "attn"),
+    init_from_centroids: bool = True,
 ) -> "UPipeRegistry":
     """Apply MASC vocabulary surgery and (optionally) UPipe attention patching.
 
@@ -161,6 +234,8 @@ def apply_masc_and_upipe(
     created.  The correct application order is:
 
     1. MASC: resize embedding table + output head to k-way coarse vocab.
+       If `init_from_centroids` is True, initialize using cluster-average
+       centroids of pretrained weights to enable fast fine-tuning.
     2. UPipe: wrap every attention layer for head-chunked execution.
 
     Order matters: UPipe must see the already-resized model so it can
@@ -184,6 +259,9 @@ def apply_masc_and_upipe(
     attn_submodule_names:
         Attention submodule names to search; forwarded to
         :func:`~masc.upipe_attention.patch_upipe_attention`.
+    init_from_centroids:
+        Whether to initialize the resized embedding and head as cluster
+        centroids of the pretrained model weights. Default: True.
 
     Returns
     -------
@@ -192,8 +270,9 @@ def apply_masc_and_upipe(
         :func:`~masc.upipe_attention.unpatch_upipe_attention` to undo.
     """
     # Step 1 — MASC: vocabulary surgery
-    resize_token_embedding(adapter, k)
-    resize_output_head(adapter, k)
+    map_for_init = mapping if init_from_centroids else None
+    resize_token_embedding(adapter, k, mapping=map_for_init)
+    resize_output_head(adapter, k, mapping=map_for_init)
     print(f"[MASC+UPipe] MASC surgery done: vocab {mapping.shape[0]} → k={k}")
 
     # Step 2 — UPipe: attention patching (optional)

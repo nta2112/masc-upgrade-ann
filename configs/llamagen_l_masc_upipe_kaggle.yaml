@@ -29,23 +29,22 @@ upipe:
 
 optimizer:
   name: adamw
-  peak_lr: 5.0e-5      # Lower LR for fine-tuning (paper uses 1e-4 for scratch)
-  final_lr: 5.0e-6
+  peak_lr: 1.0e-4      # Optimal LR for fine-tuning with centroid init
+  final_lr: 1.0e-5
   betas: [0.9, 0.95]
   eps: 1.0e-8
   weight_decay: 0.05
 
 train:
   epochs: null          # Use total_steps instead
-  total_steps: 15000    # Proof-of-concept: ~2.5h on T4 with batch 8
-  global_batch_size: 128
-  local_batch_size: 8   # Per-GPU; multiply by num_gpus × grad_accum_steps
-  grad_accum_steps: 16  # effective batch = 8 × 16 = 128
+  total_steps: 8000     # ~1-1.2h on 2× T4 with batch 24 (48/step = 384k images)
+  global_batch_size: 48
+  local_batch_size: 24  # 24 per GPU × 2 GPUs = 48/step (~4-5 GB VRAM / 15.6 GB)
   grad_clip: 1.0
   amp: true             # bf16 preferred; T4 uses fp16
   amp_dtype: float16
-  ckpt_every: 2000      # Save every 2000 steps (~20 min)
+  ckpt_every: 1000      # Save every 1000 steps (~8-10 min)
   grad_checkpointing: true
 
 num_workers: 2          # Kaggle has limited CPU cores
-log_every: 20           # More frequent for monitoring
+log_every: 20           # Frequent monitoring
