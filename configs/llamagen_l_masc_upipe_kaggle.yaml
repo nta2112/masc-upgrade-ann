@@ -17,35 +17,35 @@ backbone:
   image_size: 256
   tokenizer: llamagen_vq16384
   pretrained: /kaggle/working/weights/c2i_L_256.pt  # Auto-downloaded by Cell 2
-  freeze_layers: 20    # Freeze first 20 layers, only train top 4 layers + embeddings + head
+  freeze_layers: 0    # Full fine-tuning: unfreeze all 24 layers for true convergence
 
 masc:
-  k: 4096              # Smaller than paper's 8192 → saves ~70MB embedding VRAM
+  k: 4096              # Coarse vocabulary k=4096 (Algorithm 1)
   decode: random_sampling
 
 upipe:
   enabled: true
-  chunk_heads: 4       # LlamaGen-L has 16 heads → U=4 stages → ~4x VRAM saving
+  chunk_heads: 4       # LlamaGen-L has 16 heads -> U=4 stages -> ~4x VRAM saving
   use_flash: true      # Flash-Attention 2 within each chunk (T4 supports it)
 
 optimizer:
   name: adamw
-  peak_lr: 2.0e-4      # Higher LR for fast head + 4 layers fine-tuning
-  final_lr: 2.0e-5
+  peak_lr: 1.0e-4      # Optimal LR for full backbone fine-tuning (paper Table 8)
+  final_lr: 1.0e-5
   betas: [0.9, 0.95]
   eps: 1.0e-8
   weight_decay: 0.05
 
 train:
-  epochs: null          # Use total_steps instead
-  total_steps: 3500     # ~8-10 minutes on 2× T4 (0.15s/step = 3500 steps)
+  epochs: 1.0          # Exactly 1 full epoch over ImageNet (~1.28M images, ~40,000 steps)
+  total_steps: null    # Computed dynamically from dataset size & batch size
   global_batch_size: 32
-  local_batch_size: 16  # 16 per GPU × 2 GPUs = 32/step (~4-5 GB VRAM with frozen backbone)
+  local_batch_size: 16 # 16 per GPU x 2 GPUs = 32/step (12.40 GB VRAM, completely stable on T4)
   grad_clip: 1.0
-  amp: true             # bf16 preferred; T4 uses fp16
+  amp: true            # bf16 preferred; T4 uses fp16
   amp_dtype: float16
-  ckpt_every: 1000      # Save every 1000 steps (~2.5-3 min)
+  ckpt_every: 2500     # Save rolling checkpoint every 2500 steps (~35 min)
   grad_checkpointing: true
 
 num_workers: 2          # Kaggle has limited CPU cores
-log_every: 20           # Frequent monitoring
+log_every: 50           # Log step progress and epoch fraction every 50 steps

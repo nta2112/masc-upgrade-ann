@@ -251,7 +251,18 @@ def main() -> None:
 
     opt = build_optimizer(model, cfg)
     train_cfg = cfg["train"]
-    total_steps = train_cfg["total_steps"]
+    epochs = train_cfg.get("epochs")
+    global_batch = local_batch * (world_size if is_ddp else 1)
+    if epochs is not None and epochs > 0:
+        steps_per_epoch = max(1, len(ds) // max(1, global_batch))
+        total_steps = int(epochs * steps_per_epoch)
+        if is_main:
+            print(f"[train] Epoch-based training: {epochs} epoch(s) | {len(ds):,} samples | global batch {global_batch} -> {total_steps:,} total steps ({steps_per_epoch:,} steps/epoch)")
+    else:
+        total_steps = train_cfg.get("total_steps", 40000)
+        steps_per_epoch = max(1, len(ds) // max(1, global_batch))
+        if is_main:
+            print(f"[train] Step-based training: {total_steps:,} total steps (batch {global_batch}, ~{total_steps/steps_per_epoch:.2f} epochs)")
     peak_lr = cfg["optimizer"]["peak_lr"]
     final_lr = cfg["optimizer"]["final_lr"]
     grad_clip = train_cfg.get("grad_clip", 1.0)
@@ -297,8 +308,9 @@ def main() -> None:
     step = start_step
 
     while step < total_steps:
+        cur_epoch = int(step / max(1, steps_per_epoch))
         if is_ddp and sampler is not None:
-            sampler.set_epoch(step)
+            sampler.set_epoch(cur_epoch)
         for codes, label in loader:
             codes = torch.as_tensor(codes, device=device)   # [B, L] fine z^q
             label = torch.as_tensor(label, device=device)
@@ -324,7 +336,9 @@ def main() -> None:
             scaler.update()
 
             if is_main and step % cfg.get("log_every", 50) == 0:
-                print(f"[train] step {step}/{total_steps}  loss={loss.item():.4f}",
+                epoch_prog = (step * global_batch) / max(1, len(ds))
+                vram_gb = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
+                print(f"[train] step {step}/{total_steps} | epoch {epoch_prog:.2f} | loss={loss.item():.4f} | lr={opt.param_groups[0]['lr']:.2e} | VRAM: {vram_gb:.2f} GB",
                       flush=True)
             if is_main and step > 0 and step % train_cfg.get("ckpt_every", 10000) == 0:
                 raw_model = model.module if hasattr(model, "module") else model
