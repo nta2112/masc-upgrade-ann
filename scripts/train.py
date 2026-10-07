@@ -282,6 +282,21 @@ def main() -> None:
                 scaler.load_state_dict(ckpt["scaler"])
             if is_main:
                 print(f"[train] Resumed from step {start_step} ({args.resume})")
+
+            # Nếu checkpoint đã đạt hoặc vượt total_steps gốc (ví dụ đã xong 1 epoch = 40,036 steps)
+            # Tự động cộng dồn số bước cần train thêm để chạy tiếp đúng số epochs mong muốn
+            if start_step >= total_steps:
+                added_steps = int((epochs or 1.0) * steps_per_epoch)
+                total_steps = start_step + added_steps
+                if is_main:
+                    print(f"[train] Checkpoint đã hoàn thành epoch trước. Tự động train THÊM {epochs or 1.0} epoch ({added_steps:,} steps) -> Mục tiêu mới: {total_steps:,} steps!")
+            elif epochs is not None:
+                # Nếu muốn train thêm đủ 1 epoch tính từ điểm resume
+                target_from_now = start_step + int(epochs * steps_per_epoch)
+                if target_from_now > total_steps:
+                    total_steps = target_from_now
+                    if is_main:
+                        print(f"[train] Mở rộng mục tiêu train thêm {epochs} epoch từ checkpoint -> Mục tiêu mới: {total_steps:,} steps!")
         except Exception as e:
             if is_main:
                 print(f"[train] WARNING: Failed to load {args.resume}: {e}")
