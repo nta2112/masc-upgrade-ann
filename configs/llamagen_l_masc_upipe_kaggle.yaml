@@ -17,7 +17,7 @@ backbone:
   image_size: 256
   tokenizer: llamagen_vq16384
   pretrained: /kaggle/working/weights/c2i_L_256.pt  # Auto-downloaded by Cell 2
-  freeze_layers: 0    # Full fine-tuning: unfreeze all 24 layers for true convergence
+  freeze_layers: 16   # Freeze first 16 layers: keeps pretrained features, only trains last 8 layers + head (3x faster!)
 
 masc:
   k: 4096              # Coarse vocabulary k=4096 (Algorithm 1)
@@ -47,5 +47,5 @@ train:
   ckpt_every: 2500     # Save rolling checkpoint every 2500 steps (~35 min)
   grad_checkpointing: true
 
-num_workers: 2          # Kaggle has limited CPU cores
+num_workers: 4          # Maximize 4 Kaggle vCPUs for fast pipeline data loading
 log_every: 50           # Log step progress and epoch fraction every 50 steps
