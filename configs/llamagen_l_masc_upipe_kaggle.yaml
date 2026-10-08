@@ -39,8 +39,8 @@ optimizer:
 train:
   epochs: 1.0          # Exactly 1 full epoch over ImageNet (~1.28M images, ~40,000 steps)
   total_steps: null    # Computed dynamically from dataset size & batch size
-  global_batch_size: 32
-  local_batch_size: 16 # 16 per GPU x 2 GPUs = 32/step (12.40 GB VRAM, completely stable on T4)
+  global_batch_size: 48
+  local_batch_size: 24 # 24 per GPU x 2 GPUs = 48/step (Tận dụng ~12 GB VRAM khi freeze 16 tầng, tăng tốc tối đa!)
   grad_clip: 1.0
   amp: true            # bf16 preferred; T4 uses fp16
   amp_dtype: float16
