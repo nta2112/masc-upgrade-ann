@@ -127,6 +127,11 @@ def main() -> None:
     # Resume from a previous checkpoint
     ap.add_argument("--resume", default=None,
                     help="Path to checkpoint .pt file to resume from.")
+    # Epochs override (e.g. --epochs 15.0)
+    ap.add_argument("--epochs", type=float, default=None,
+                    help="Number of epochs to train (overrides config).")
+    ap.add_argument("--ckpt-every", type=int, default=None,
+                    help="Checkpoint interval in steps (overrides config).")
     args = ap.parse_args()
 
     import torch
@@ -251,7 +256,8 @@ def main() -> None:
 
     opt = build_optimizer(model, cfg)
     train_cfg = cfg["train"]
-    epochs = train_cfg.get("epochs")
+    epochs = args.epochs if args.epochs is not None else train_cfg.get("epochs")
+    ckpt_every = args.ckpt_every if args.ckpt_every is not None else train_cfg.get("ckpt_every", 1000)
     global_batch = local_batch * (world_size if is_ddp else 1)
     if epochs is not None and epochs > 0:
         steps_per_epoch = max(1, len(ds) // max(1, global_batch))
@@ -355,7 +361,7 @@ def main() -> None:
                 vram_gb = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
                 print(f"[train] step {step}/{total_steps} | epoch {epoch_prog:.2f} | loss={loss.item():.4f} | lr={opt.param_groups[0]['lr']:.2e} | VRAM: {vram_gb:.2f} GB",
                       flush=True)
-            if is_main and step > 0 and step % train_cfg.get("ckpt_every", 10000) == 0:
+            if is_main and step > 0 and step % ckpt_every == 0:
                 raw_model = model.module if hasattr(model, "module") else model
                 ckpt_dest = os.path.join(args.out, f"ckpt_{step}.pt")
                 ckpt_tmp = ckpt_dest + ".tmp"
