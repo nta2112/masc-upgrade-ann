@@ -37,7 +37,7 @@ optimizer:
   weight_decay: 0.05
 
 train:
-  epochs: 1.0          # Exactly 1 full epoch over ImageNet (~1.28M images, ~40,000 steps)
+  epochs: 15.0         # 15 epochs cho tập 10 class (10,000 ảnh, ~4,687 steps)
   total_steps: null    # Computed dynamically from dataset size & batch size
   global_batch_size: 32
   local_batch_size: 16 # 16 per GPU x 2 GPUs = 32/step (12.4 GB VRAM rock-solid khi unfreeze 24 tầng)
