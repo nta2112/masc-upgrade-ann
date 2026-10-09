@@ -365,8 +365,9 @@ def main() -> None:
                 raw_model = model.module if hasattr(model, "module") else model
                 ckpt_dest = os.path.join(args.out, f"ckpt_{step}.pt")
                 ckpt_tmp = ckpt_dest + ".tmp"
+                clean_model_state = {k.replace("._original.", "."): v for k, v in raw_model.state_dict().items()}
                 torch.save({
-                    "model":     raw_model.state_dict(),
+                    "model":     clean_model_state,
                     "optimizer": opt.state_dict(),
                     "scaler":    scaler.state_dict(),
                     "step":      step,
@@ -391,7 +392,8 @@ def main() -> None:
     if is_main:
         raw_model = model.module if hasattr(model, "module") else model
         final_dest = os.path.join(args.out, "ckpt_final.pt")
-        torch.save({"model": raw_model.state_dict(), "step": step}, final_dest)
+        clean_model_state = {k.replace("._original.", "."): v for k, v in raw_model.state_dict().items()}
+        torch.save({"model": clean_model_state, "step": step}, final_dest)
         print(f"[train] Saved final checkpoint: {final_dest}")
 
         # Clean up all intermediate checkpoints since final checkpoint is successfully saved
