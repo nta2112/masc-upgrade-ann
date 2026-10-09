@@ -17,7 +17,7 @@ backbone:
   image_size: 256
   tokenizer: llamagen_vq16384
   pretrained: /kaggle/working/weights/c2i_L_256.pt  # Auto-downloaded by Cell 2
-  freeze_layers: 16   # Freeze first 16 layers: keeps pretrained features, only trains last 8 layers + head (3x faster!)
+  freeze_layers: 0    # Full unfreeze 24 layers: all layers adapt specifically to target classes
 
 masc:
   k: 4096              # Coarse vocabulary k=4096 (Algorithm 1)
@@ -39,8 +39,8 @@ optimizer:
 train:
   epochs: 1.0          # Exactly 1 full epoch over ImageNet (~1.28M images, ~40,000 steps)
   total_steps: null    # Computed dynamically from dataset size & batch size
-  global_batch_size: 48
-  local_batch_size: 24 # 24 per GPU x 2 GPUs = 48/step (Tận dụng ~12 GB VRAM khi freeze 16 tầng, tăng tốc tối đa!)
+  global_batch_size: 32
+  local_batch_size: 16 # 16 per GPU x 2 GPUs = 32/step (12.4 GB VRAM rock-solid khi unfreeze 24 tầng)
   grad_clip: 1.0
   amp: true            # bf16 preferred; T4 uses fp16
   amp_dtype: float16

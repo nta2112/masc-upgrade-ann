@@ -27,7 +27,23 @@ import numpy as np
 
 from .mapping import MASCMapping
 
-__all__ = ["random_sample_decode"]
+__all__ = ["random_sample_decode", "mode_sample_decode"]
+
+
+def mode_sample_decode(
+    coarse_indices: np.ndarray,
+    mapping: MASCMapping,
+) -> np.ndarray:
+    """Deterministic decoder: picks the primary representative token for each cluster.
+
+    Avoids random token scattering within clusters, preserving sharp geometric
+    consistency and clean VQ-VAE code reconstruction.
+    """
+    c = np.asarray(coarse_indices, dtype=np.int64)
+    flat_c = c.reshape(-1)
+    # Always take the primary centroid representative (offset 0)
+    tokens = mapping.member_table[flat_c, 0]
+    return tokens.reshape(c.shape)
 
 
 def random_sample_decode(

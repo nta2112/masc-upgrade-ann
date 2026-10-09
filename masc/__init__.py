@@ -24,7 +24,7 @@ from .distance import average_linkage_distance, pairwise_euclidean
 from .clustering import MASCTree, build_masc_tree
 from .mapping import MASCMapping, invert_mapping, load_mapping, save_mapping
 from .relabel import relabel_targets
-from .decode import random_sample_decode
+from .decode import random_sample_decode, mode_sample_decode
 # Integration (requires PyTorch) — imported lazily only when torch is present
 try:
     from .integration import (
@@ -56,6 +56,7 @@ __all__ = [
     "save_mapping",
     "relabel_targets",
     "random_sample_decode",
+    "mode_sample_decode",
     # torch integration
     "ARBackbone",
     "resize_token_embedding",
