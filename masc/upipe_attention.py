@@ -409,7 +409,7 @@ def patch_upipe_attention(
     return _registry
 
 
-def unpatch_upipe_attention(model: nn.Module, registry: dict) -> None:
+def unpatch_upipe_attention(model: nn.Module, registry: Optional[dict] = None) -> None:
     """Restore all attention layers patched by :func:`patch_upipe_attention`.
 
     Parameters
@@ -417,16 +417,31 @@ def unpatch_upipe_attention(model: nn.Module, registry: dict) -> None:
     model:
         Same model passed to :func:`patch_upipe_attention`.
     registry:
-        Dict returned by :func:`patch_upipe_attention`.
+        Optional dict returned by :func:`patch_upipe_attention`. If None,
+        automatically scans model modules to unwrap any UPipeAttentionWrapper.
     """
-    for (layer_name, attr_name), original in registry.items():
-        parent = model
-        for part in layer_name.split("."):
-            if part:
-                parent = getattr(parent, part)
-        setattr(parent, attr_name, original)
-    registry.clear()
-    print("[UPipe] All attention layers restored.")
+    if registry is not None:
+        for (layer_name, attr_name), original in registry.items():
+            parent = model
+            for part in layer_name.split("."):
+                if part:
+                    parent = getattr(parent, part)
+            setattr(parent, attr_name, original)
+        registry.clear()
+        print("[UPipe] All attention layers restored from registry.")
+        return
+
+    # Auto-detection fallback when registry is None
+    restored_count = 0
+    for module in model.modules():
+        for child_name, child in list(module.named_children()):
+            if isinstance(child, UPipeAttentionWrapper):
+                setattr(module, child_name, child._original)
+                restored_count += 1
+    if restored_count > 0:
+        print(f"[UPipe] Restored {restored_count} attention layer(s) (auto-detected).")
+    else:
+        print("[UPipe] Model is already in vanilla state (no UPipe wrappers found).")
 
 
 # ---------------------------------------------------------------------------
