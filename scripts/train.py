@@ -132,6 +132,10 @@ def main() -> None:
                     help="Number of epochs to train (overrides config).")
     ap.add_argument("--ckpt-every", type=int, default=None,
                     help="Checkpoint interval in steps (overrides config).")
+    ap.add_argument("--batch-size", type=int, default=None,
+                    help="Batch size per GPU (overrides config local_batch_size).")
+    ap.add_argument("--grad-accum", type=int, default=None,
+                    help="Gradient accumulation steps (overrides config grad_accum).")
     args = ap.parse_args()
 
     import torch
@@ -188,6 +192,17 @@ def main() -> None:
             model.gradient_checkpointing_enable()
             if is_main:
                 print("[train] Gradient checkpointing enabled (HuggingFace API).")
+        elif hasattr(model, "layers"):
+            import torch.utils.checkpoint as checkpoint
+            for block in model.layers:
+                orig_forward = block.forward
+                def _make_ckpt_forward(fn):
+                    def _forward(*args, **kwargs):
+                        return checkpoint.checkpoint(fn, *args, use_reentrant=False, **kwargs)
+                    return _forward
+                block.forward = _make_ckpt_forward(orig_forward)
+            if is_main:
+                print("[train] Gradient checkpointing applied to transformer layers (torch.utils.checkpoint).")
         else:
             if is_main:
                 print("[train] gradient_checkpointing_enable() not found on model.")
@@ -228,7 +243,12 @@ def main() -> None:
 
     # --- Data / optim -------------------------------------------------------
     ds = CodeDataset(args.codes)
-    local_batch = cfg["train"].get("local_batch_size", 8)
+    train_cfg = cfg["train"]
+    local_batch = args.batch_size if args.batch_size is not None else train_cfg.get("local_batch_size", 8)
+    grad_accum = args.grad_accum if args.grad_accum is not None else train_cfg.get("grad_accum", 1)
+    if grad_accum < 1:
+        grad_accum = 1
+
     num_workers = min(4, os.cpu_count() or 1)
     if ds.is_sharded:
         sampler = DistributedSampler(ds, shuffle=True) if is_ddp else None
@@ -255,10 +275,11 @@ def main() -> None:
         )
 
     opt = build_optimizer(model, cfg)
-    train_cfg = cfg["train"]
     epochs = args.epochs if args.epochs is not None else train_cfg.get("epochs")
     ckpt_every = args.ckpt_every if args.ckpt_every is not None else train_cfg.get("ckpt_every", 1000)
-    global_batch = local_batch * (world_size if is_ddp else 1)
+    global_batch = local_batch * (world_size if is_ddp else 1) * grad_accum
+    if is_main:
+        print(f"[train] Batch setup: {local_batch}/GPU x {world_size if is_ddp else 1} GPU(s) x {grad_accum} accum = {global_batch} Global Batch")
     if epochs is not None and epochs > 0:
         steps_per_epoch = max(1, len(ds) // max(1, global_batch))
         total_steps = int(epochs * steps_per_epoch)
@@ -327,6 +348,9 @@ def main() -> None:
         os.makedirs(args.out, exist_ok=True)
     model.train()
     step = start_step
+    accum_step = 0
+    running_loss = 0.0
+    opt.zero_grad(set_to_none=True)
 
     while step < total_steps:
         cur_epoch = int(step / max(1, steps_per_epoch))
@@ -347,45 +371,68 @@ def main() -> None:
                     logits = out[0] if isinstance(out, tuple) else out
                     if logits.shape[1] > coarse_in.shape[1]:
                         logits = logits[:, :coarse_in.shape[1], :]
-                loss = objective.loss(logits, codes)
+                raw_loss = objective.loss(logits, codes)
+                loss = raw_loss / grad_accum
 
-            opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
+            accum_step += 1
+            running_loss += raw_loss.item()
+
+            if accum_step % grad_accum == 0:
+                scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                scaler.step(opt)
+                scaler.update()
+                opt.zero_grad(set_to_none=True)
+                step += 1
+
+                if is_main and step % cfg.get("log_every", 50) == 0:
+                    epoch_prog = (step * global_batch) / max(1, len(ds))
+                    vram_gb = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
+                    avg_loss = running_loss / grad_accum
+                    print(f"[train] step {step}/{total_steps} | epoch {epoch_prog:.2f} | loss={avg_loss:.4f} | lr={opt.param_groups[0]['lr']:.2e} | VRAM: {vram_gb:.2f} GB",
+                          flush=True)
+                    running_loss = 0.0
+                else:
+                    running_loss = 0.0
+
+                if is_main and step > 0 and step % ckpt_every == 0:
+                    raw_model = model.module if hasattr(model, "module") else model
+                    ckpt_dest = os.path.join(args.out, f"ckpt_{step}.pt")
+                    ckpt_tmp = ckpt_dest + ".tmp"
+                    clean_model_state = {k.replace("._original.", "."): v for k, v in raw_model.state_dict().items()}
+                    torch.save({
+                        "model":     clean_model_state,
+                        "optimizer": opt.state_dict(),
+                        "scaler":    scaler.state_dict(),
+                        "step":      step,
+                        "upipe_chunk_heads": chunk_heads,
+                        "masc_k":    mp.k,
+                    }, ckpt_tmp)
+                    os.replace(ckpt_tmp, ckpt_dest)
+                    print(f"[train] Saved checkpoint: {ckpt_dest}")
+
+                    # Keep only the latest 1 checkpoint to avoid exceeding Kaggle disk quota
+                    all_ckpts = sorted(glob.glob(os.path.join(args.out, "ckpt_[0-9]*.pt")))
+                    for old_ck in all_ckpts[:-1]:
+                        try:
+                            os.remove(old_ck)
+                            print(f"[train] Removed old {os.path.basename(old_ck)} to free disk space")
+                        except Exception:
+                            pass
+
+                if step >= total_steps:
+                    break
+
+        if accum_step % grad_accum != 0:
             scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             scaler.step(opt)
             scaler.update()
-
-            if is_main and step % cfg.get("log_every", 50) == 0:
-                epoch_prog = (step * global_batch) / max(1, len(ds))
-                vram_gb = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
-                print(f"[train] step {step}/{total_steps} | epoch {epoch_prog:.2f} | loss={loss.item():.4f} | lr={opt.param_groups[0]['lr']:.2e} | VRAM: {vram_gb:.2f} GB",
-                      flush=True)
-            if is_main and step > 0 and step % ckpt_every == 0:
-                raw_model = model.module if hasattr(model, "module") else model
-                ckpt_dest = os.path.join(args.out, f"ckpt_{step}.pt")
-                ckpt_tmp = ckpt_dest + ".tmp"
-                clean_model_state = {k.replace("._original.", "."): v for k, v in raw_model.state_dict().items()}
-                torch.save({
-                    "model":     clean_model_state,
-                    "optimizer": opt.state_dict(),
-                    "scaler":    scaler.state_dict(),
-                    "step":      step,
-                    "upipe_chunk_heads": chunk_heads,
-                    "masc_k":    mp.k,
-                }, ckpt_tmp)
-                os.replace(ckpt_tmp, ckpt_dest)
-                print(f"[train] Saved checkpoint: {ckpt_dest}")
-
-                # Keep only the latest 1 checkpoint to avoid exceeding Kaggle disk quota
-                all_ckpts = sorted(glob.glob(os.path.join(args.out, "ckpt_[0-9]*.pt")))
-                for old_ck in all_ckpts[:-1]:
-                    try:
-                        os.remove(old_ck)
-                        print(f"[train] Removed old {os.path.basename(old_ck)} to free disk space")
-                    except Exception:
-                        pass
+            opt.zero_grad(set_to_none=True)
             step += 1
+            accum_step = 0
+            running_loss = 0.0
             if step >= total_steps:
                 break
 

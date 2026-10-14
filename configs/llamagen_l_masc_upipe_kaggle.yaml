@@ -40,7 +40,8 @@ train:
   epochs: 15.0         # 15 epochs cho tập 10 class (10,000 ảnh, ~4,687 steps)
   total_steps: null    # Computed dynamically from dataset size & batch size
   global_batch_size: 32
-  local_batch_size: 16 # 16 per GPU x 2 GPUs = 32/step (12.4 GB VRAM rock-solid khi unfreeze 24 tầng)
+  local_batch_size: 8  # 8 per GPU x 2 GPUs x 2 grad_accum = 32 global batch (an toàn tuyệt đối trên T4 16GB)
+  grad_accum: 2        # Gradient accumulation 2 bước
   grad_clip: 1.0
   amp: true            # bf16 preferred; T4 uses fp16
   amp_dtype: float16
